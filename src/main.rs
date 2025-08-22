@@ -20,14 +20,55 @@ impl InputBuffer {
     }
 }
 
+// Non-SQL statements like .exit are called “meta-commands”.
 enum MetaCommands {
     Exit,
+    Unrecognized,
 }
 
-fn parse_command(input: &str) -> Option<MetaCommands> {
-    match input {
-        ".exit" => Some(MetaCommands::Exit),
-        _ => None,
+impl MetaCommands {
+    fn parse(input: &str) -> Option<MetaCommands> {
+        match input {
+            ".exit" => Some(MetaCommands::Exit),
+            _ => {
+                if input.starts_with(".") {
+                    Some(MetaCommands::Unrecognized)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+enum StatementType {
+    Select,
+    Insert,
+    Unrecognized,
+}
+
+impl StatementType {
+    fn parse(input: &str) -> StatementType {
+        match input {
+            "select" => StatementType::Select,
+            "insert" => StatementType::Insert,
+            _ => StatementType::Unrecognized,
+        }
+    }
+}
+
+enum InputType {
+    Meta(MetaCommands),
+    Statement(StatementType),
+}
+
+impl InputType {
+    fn parse(input: &str) -> InputType {
+        if let Some(meta) = MetaCommands::parse(input) {
+            InputType::Meta(meta)
+        } else {
+            InputType::Statement(StatementType::parse(input))
+        }
     }
 }
 
@@ -44,9 +85,16 @@ fn main() {
         print_prompt();
         input_buffer.read_input();
 
-        match parse_command(&input_buffer.buffer) {
-            Some(MetaCommands::Exit) => break,
-            None => println!("Unrecognized command: {}", input_buffer.buffer),
+        match InputType::parse(&input_buffer.buffer) {
+            InputType::Meta(MetaCommands::Exit) => break,
+            InputType::Meta(MetaCommands::Unrecognized) => {
+                println!("Unrecognized meta-command: {}", input_buffer.buffer);
+            }
+            InputType::Statement(StatementType::Select) => println!("select call"),
+            InputType::Statement(StatementType::Insert) => println!("insert call"),
+            InputType::Statement(StatementType::Unrecognized) => {
+                println!("Unrecognized command: {}", input_buffer.buffer)
+            }
         }
     }
 }
