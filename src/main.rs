@@ -1,20 +1,5 @@
-use std::{fmt, io, mem::size_of};
-
-const COLUMN_USERNAME_SIZE: usize = 32;
-const COLUMN_EMAIL_SIZE: usize = 255;
-const ID_SIZE: usize = size_of::<u32>();
-const USERNAME_SIZE: usize = COLUMN_USERNAME_SIZE;
-const EMAIL_SIZE: usize = COLUMN_EMAIL_SIZE;
-
-const ID_OFFSET: usize = 0;
-const USERNAME_OFFSET: usize = ID_OFFSET + ID_SIZE;
-const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
-const ROW_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-
-const PAGE_SIZE: usize = 4096;
-const TABLE_MAX_PAGES: usize = 100;
-const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
-const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
+use rust_sqlite::*;
+use std::{fmt, io};
 
 struct InputBuffer {
     buffer: String,
@@ -60,6 +45,8 @@ impl MetaCommands {
 enum PrepareStatement {
     Success(Statement),
     SyntaxError,
+    NegativeID,
+    StringTooLong,
     Unrecognized,
 }
 
@@ -75,20 +62,20 @@ impl PrepareStatement {
 
             let id = match parts[1].parse::<u32>() {
                 Ok(val) => val,
-                Err(_) => return PrepareStatement::SyntaxError,
+                Err(_) => return PrepareStatement::NegativeID,
             };
 
             let mut username = [0u8; COLUMN_USERNAME_SIZE];
             let username_bytes = parts[2].as_bytes();
             if username_bytes.len() > COLUMN_USERNAME_SIZE {
-                return PrepareStatement::SyntaxError;
+                return PrepareStatement::StringTooLong;
             }
             username[..username_bytes.len()].copy_from_slice(username_bytes);
 
             let mut email = [0u8; COLUMN_EMAIL_SIZE];
             let email_bytes = parts[3].as_bytes();
             if email_bytes.len() > COLUMN_EMAIL_SIZE {
-                return PrepareStatement::SyntaxError;
+                return PrepareStatement::StringTooLong;
             }
             email[..email_bytes.len()].copy_from_slice(email_bytes);
 
@@ -257,6 +244,14 @@ fn main() {
             }
             InputType::PrepareStatement(PrepareStatement::SyntaxError) => {
                 println!("Syntax error. Could not parse statement.");
+                continue;
+            }
+            InputType::PrepareStatement(PrepareStatement::StringTooLong) => {
+                println!("String is too long.");
+                continue;
+            }
+            InputType::PrepareStatement(PrepareStatement::NegativeID) => {
+                println!("ID must be positive.");
                 continue;
             }
             InputType::PrepareStatement(PrepareStatement::Unrecognized) => {
