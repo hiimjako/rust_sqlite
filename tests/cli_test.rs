@@ -1,13 +1,28 @@
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::str::FromStr;
 
     use assert_cmd::Command;
     use predicates::prelude::*;
     use rust_sqlite::{EMAIL_SIZE, TABLE_MAX_ROWS, USERNAME_SIZE};
+    use tempfile::NamedTempFile;
 
+    // Helper function to run the command with a temporary database file
     fn run_commands<T: AsRef<str>>(commands: &[T]) -> Command {
+        let db_path = create_db_path();
+        run_commands_with_args(commands, &db_path)
+    }
+
+    fn create_db_path() -> PathBuf {
+        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
+        let db_path: PathBuf = temp_file.path().to_path_buf();
+        db_path
+    }
+
+    fn run_commands_with_args<T: AsRef<str>>(commands: &[T], db_path: &Path) -> Command {
         let mut cmd = Command::cargo_bin("rust-sqlite").expect("Failed to run command");
+        cmd.arg(db_path.to_str().expect("Invalid path"));
 
         let input = commands
             .iter()
@@ -46,6 +61,30 @@ mod tests {
         cmd.assert()
             .success()
             .stdout(predicate::str::contains("db > Error: Table full."));
+    }
+
+    #[test]
+    fn it_fills_and_save_full_table() {
+        let mut commands = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..TABLE_MAX_ROWS {
+            commands.push(format!("insert {i} user{i} person{i}@example.com"));
+            expected.push(format!("({i}, user{i}, person{i}@example.com)"));
+        }
+        commands.push(String::from_str(".exit").unwrap());
+
+        let db_path = create_db_path();
+        let mut cmd = run_commands_with_args(&commands, &db_path);
+
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::ends_with("db > "));
+
+        let mut cmd = run_commands_with_args(&["select", ".exit"], &db_path);
+        let expected = expected.join("\n");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains(expected));
     }
 
     #[test]
@@ -100,6 +139,20 @@ mod tests {
 
         let expected = ["db > ID must be positive.", "db > Executed.", "db > "].join("\n");
 
+        cmd.assert().success().stdout(expected);
+    }
+
+    #[test]
+    fn it_keeps_data_after_closing_connection() {
+        let db_path = create_db_path();
+
+        let mut cmd =
+            run_commands_with_args(&["insert 1 user1 person1@example.com", ".exit"], &db_path);
+        let expected = ["db > Executed.", "db > "].join("\n");
+        cmd.assert().success().stdout(expected);
+
+        let mut cmd = run_commands_with_args(&["select", ".exit"], &db_path);
+        let expected = ["db > (1, user1, person1@example.com)\nExecuted.", "db > "].join("\n");
         cmd.assert().success().stdout(expected);
     }
 }
