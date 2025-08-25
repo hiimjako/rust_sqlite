@@ -206,6 +206,32 @@ impl fmt::Display for Row {
     }
 }
 
+struct Cursor {
+    table: Table,
+    num_rows: usize,
+    end_of_table: bool,
+}
+
+impl Cursor {
+    fn table_start(table: Table) -> Cursor {
+        let end_of_table = table.num_rows == 0;
+        Cursor {
+            table,
+            num_rows: 0,
+            end_of_table,
+        }
+    }
+
+    fn table_end(table: Table) -> Cursor {
+        let num_rows = table.num_rows;
+        Cursor {
+            table,
+            num_rows,
+            end_of_table: true,
+        }
+    }
+}
+
 /// Represents the database table structure.
 struct Table {
     num_rows: usize,
