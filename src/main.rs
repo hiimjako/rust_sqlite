@@ -1,5 +1,6 @@
 use clap::{Parser, arg};
 use rust_sqlite::*;
+use std::error::Error;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fmt,
@@ -41,73 +42,58 @@ enum MetaCommands {
 impl MetaCommands {
     /// Parses an input string to check for a valid meta-command.
     fn parse(input: &str) -> Option<MetaCommands> {
-        match input {
-            ".exit" => Some(MetaCommands::Exit),
-            _ => {
-                if input.starts_with('.') {
-                    Some(MetaCommands::Unrecognized)
-                } else {
-                    None
-                }
+        if input.starts_with('.') {
+            match input {
+                ".exit" => Some(MetaCommands::Exit),
+                _ => Some(MetaCommands::Unrecognized),
             }
-        }
-    }
-}
-
-/// Represents the result of preparing a statement.
-enum PrepareStatement {
-    Success(Statement),
-    SyntaxError,
-    NegativeID,
-    StringTooLong,
-    Unrecognized,
-}
-
-impl PrepareStatement {
-    /// Parses an input string into a `Statement`.
-    fn parse(input: &str) -> PrepareStatement {
-        if input.starts_with("select") {
-            PrepareStatement::Success(Statement::Select)
-        } else if input.starts_with("insert") {
-            let parts: Vec<&str> = input.split_whitespace().collect();
-            if parts.len() != 4 {
-                return PrepareStatement::SyntaxError;
-            }
-
-            let id = match parts[1].parse::<u32>() {
-                Ok(val) => val,
-                Err(_) => return PrepareStatement::NegativeID,
-            };
-
-            let mut username = [0u8; COLUMN_USERNAME_SIZE];
-            let username_bytes = parts[2].as_bytes();
-            if username_bytes.len() > COLUMN_USERNAME_SIZE {
-                return PrepareStatement::StringTooLong;
-            }
-            username[..username_bytes.len()].copy_from_slice(username_bytes);
-
-            let mut email = [0u8; COLUMN_EMAIL_SIZE];
-            let email_bytes = parts[3].as_bytes();
-            if email_bytes.len() > COLUMN_EMAIL_SIZE {
-                return PrepareStatement::StringTooLong;
-            }
-            email[..email_bytes.len()].copy_from_slice(email_bytes);
-
-            PrepareStatement::Success(Statement::Insert(Box::new(Row {
-                id,
-                username,
-                email,
-            })))
         } else {
-            PrepareStatement::Unrecognized
+            None
         }
     }
 }
 
-/// Represents the result of executing a statement.
-enum ExecuteResult {
-    Success,
+#[derive(Debug)]
+enum PrepareError {
+    SyntaxError(String),
+    StringTooLong,
+    UnrecognizedStatement,
+    InvalidId,
+}
+
+#[derive(Debug)]
+enum ExecuteError {
     TableFull,
+    Io(io::Error),
+}
+
+impl Error for PrepareError {}
+impl Error for ExecuteError {}
+
+impl fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            PrepareError::SyntaxError(s) => write!(f, "Syntax error: {}", s),
+            PrepareError::StringTooLong => write!(f, "String is too long."),
+            PrepareError::UnrecognizedStatement => write!(f, "Unrecognized statement."),
+            PrepareError::InvalidId => write!(f, "ID must be positive."),
+        }
+    }
+}
+
+impl fmt::Display for ExecuteError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ExecuteError::TableFull => write!(f, "Error: Table full."),
+            ExecuteError::Io(e) => write!(f, "IO Error: {}", e),
+        }
+    }
+}
+
+impl From<io::Error> for ExecuteError {
+    fn from(err: io::Error) -> Self {
+        ExecuteError::Io(err)
+    }
 }
 
 /// Represents a database statement.
@@ -117,43 +103,84 @@ enum Statement {
 }
 
 impl Statement {
-    /// Executes the statement against the provided table.
-    fn execute(&self, table: &mut Table) -> ExecuteResult {
-        match self {
-            Statement::Select => Statement::execute_select(table),
-            Statement::Insert(row) => Statement::execute_insert(row, table),
+    /// Parses a raw input string into a `Statement`.
+    /// Returns a `Result` to handle parsing errors gracefully.
+    fn prepare(input: &str) -> Result<Statement, PrepareError> {
+        if input.starts_with("select") {
+            Ok(Statement::Select)
+        } else if input.starts_with("insert") {
+            let parts: Vec<&str> = input.split_whitespace().collect();
+            if parts.len() != 4 {
+                return Err(PrepareError::SyntaxError(
+                    "Expected 'insert <id> <username> <email>'".to_string(),
+                ));
+            }
+
+            let id = parts[1]
+                .parse::<u32>()
+                .map_err(|_| PrepareError::InvalidId)?;
+
+            let username_bytes = parts[2].as_bytes();
+            if username_bytes.len() > USERNAME_SIZE {
+                return Err(PrepareError::StringTooLong);
+            }
+            let mut username = [0u8; USERNAME_SIZE];
+            username[..username_bytes.len()].copy_from_slice(username_bytes);
+
+            let email_bytes = parts[3].as_bytes();
+            if email_bytes.len() > EMAIL_SIZE {
+                return Err(PrepareError::StringTooLong);
+            }
+            let mut email = [0u8; EMAIL_SIZE];
+            email[..email_bytes.len()].copy_from_slice(email_bytes);
+
+            Ok(Statement::Insert(Box::new(Row {
+                id,
+                username,
+                email,
+            })))
+        } else {
+            Err(PrepareError::UnrecognizedStatement)
         }
     }
 
-    /// Executes a `SELECT` statement.
-    fn execute_select(table: &mut Table) -> ExecuteResult {
-        for i in 0..table.num_rows {
-            let row_slot = table.fetch_row(i);
-            let row = Row::deserialize(row_slot);
+    /// Executes the statement against the provided table.
+    fn execute(&self, table: &mut Table) -> Result<(), ExecuteError> {
+        match self {
+            Statement::Select => {
+                self.select(table);
+                Ok(())
+            }
+            Statement::Insert(row) => self.insert(table, row),
+        }
+    }
+
+    fn select(&self, table: &mut Table) {
+        for row in table.table_start() {
             println!("{}", row);
         }
-        ExecuteResult::Success
     }
 
-    /// Executes an `INSERT` statement.
-    fn execute_insert(row: &Row, table: &mut Table) -> ExecuteResult {
+    fn insert(&self, table: &mut Table, row: &Row) -> Result<(), ExecuteError> {
         if table.num_rows >= TABLE_MAX_ROWS {
-            return ExecuteResult::TableFull;
+            return Err(ExecuteError::TableFull);
         }
 
-        let row_slot = table.insert_row(table.num_rows);
-        row.serialize(row_slot);
+        let mut cursor = table.table_end();
+        row.serialize(cursor.value());
         table.num_rows += 1;
-
-        ExecuteResult::Success
+        Ok(())
     }
 }
 
 /// Represents a single row in the database table.
+/// The `username` and `email` fields are fixed-size arrays to ensure
+/// each row has a constant size, simplifying serialization and disk I/O.
+#[derive(Debug)]
 struct Row {
     id: u32,
-    username: [u8; COLUMN_USERNAME_SIZE],
-    email: [u8; COLUMN_EMAIL_SIZE],
+    username: [u8; USERNAME_SIZE],
+    email: [u8; EMAIL_SIZE],
 }
 
 impl Row {
@@ -165,16 +192,16 @@ impl Row {
         destination[EMAIL_OFFSET..EMAIL_OFFSET + EMAIL_SIZE].copy_from_slice(&self.email);
     }
 
-    /// Deserializes a byte slice into a `Row` for reading from disk.
+    /// Deserializes a byte slice into a `Row`.
     fn deserialize(source: &[u8]) -> Row {
         let mut id_bytes = [0u8; ID_SIZE];
         id_bytes.copy_from_slice(&source[ID_OFFSET..ID_OFFSET + ID_SIZE]);
         let id = u32::from_le_bytes(id_bytes);
 
-        let mut username = [0u8; COLUMN_USERNAME_SIZE];
+        let mut username = [0u8; USERNAME_SIZE];
         username.copy_from_slice(&source[USERNAME_OFFSET..USERNAME_OFFSET + USERNAME_SIZE]);
 
-        let mut email = [0u8; COLUMN_EMAIL_SIZE];
+        let mut email = [0u8; EMAIL_SIZE];
         email.copy_from_slice(&source[EMAIL_OFFSET..EMAIL_OFFSET + EMAIL_SIZE]);
 
         Row {
@@ -206,29 +233,46 @@ impl fmt::Display for Row {
     }
 }
 
-struct Cursor {
-    table: Table,
-    num_rows: usize,
+/// A cursor for iterating over the rows in a table.
+struct Cursor<'a> {
+    table: &'a mut Table,
+    row_num: usize,
     end_of_table: bool,
 }
 
-impl Cursor {
-    fn table_start(table: Table) -> Cursor {
-        let end_of_table = table.num_rows == 0;
-        Cursor {
-            table,
-            num_rows: 0,
-            end_of_table,
-        }
+impl Cursor<'_> {
+    /// Gets a mutable slice pointing to the memory location for the cursor's current row.
+    fn value(&mut self) -> &mut [u8] {
+        let row_num = self.row_num;
+        let page_num = row_num / ROWS_PER_PAGE;
+        let page = self.table.pager.get_page(page_num);
+
+        let row_offset = row_num % ROWS_PER_PAGE;
+        let byte_offset = row_offset * ROW_SIZE;
+
+        &mut page[byte_offset..byte_offset + ROW_SIZE]
     }
 
-    fn table_end(table: Table) -> Cursor {
-        let num_rows = table.num_rows;
-        Cursor {
-            table,
-            num_rows,
-            end_of_table: true,
+    /// Advances the cursor to the next row.
+    fn advance(&mut self) {
+        self.row_num += 1;
+        if self.row_num >= self.table.num_rows {
+            self.end_of_table = true;
         }
+    }
+}
+
+impl Iterator for Cursor<'_> {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.end_of_table {
+            return None;
+        }
+
+        let row = Row::deserialize(self.value());
+        self.advance();
+        Some(row)
     }
 }
 
@@ -248,46 +292,35 @@ impl Table {
     }
 
     /// Closes the database and flushes changes to disk.
-    fn close(&mut self) {
-        let num_full_pages = self.num_rows / ROWS_PER_PAGE;
-        let num_additional_rows = self.num_rows % ROWS_PER_PAGE;
+    fn db_close(mut self) -> io::Result<()> {
+        self.pager.flush_all(self.num_rows)
+    }
 
-        for page_num in 0..num_full_pages {
-            self.pager.flush_page(page_num, PAGE_SIZE);
-            self.pager.clear_page(page_num);
-        }
-
-        if num_additional_rows > 0 {
-            let num_bytes_to_flush = num_additional_rows * ROW_SIZE;
-            self.pager.flush_page(num_full_pages, num_bytes_to_flush);
-            self.pager.clear_page(num_full_pages);
+    /// Creates an iterator over the rows of the table.
+    fn table_start(&mut self) -> Cursor {
+        let end_of_table = self.num_rows == 0;
+        Cursor {
+            table: self,
+            row_num: 0,
+            end_of_table,
         }
     }
 
-    /// Fetches a row from the table at the given index.
-    fn fetch_row(&mut self, row_num: usize) -> &[u8] {
-        let page_num = row_num / ROWS_PER_PAGE;
-        let row_offset_in_page = row_num % ROWS_PER_PAGE;
-        let byte_offset_in_page = row_offset_in_page * ROW_SIZE;
-
-        let page = self.pager.get_page(page_num);
-        &page[byte_offset_in_page..byte_offset_in_page + ROW_SIZE]
-    }
-
-    /// Gets a mutable slice to a row slot for insertion.
-    fn insert_row(&mut self, row_num: usize) -> &mut [u8] {
-        let page_num = row_num / ROWS_PER_PAGE;
-        let row_offset_in_page = row_num % ROWS_PER_PAGE;
-        let byte_offset_in_page = row_offset_in_page * ROW_SIZE;
-
-        let page = self.pager.get_page(page_num);
-        &mut page[byte_offset_in_page..byte_offset_in_page + ROW_SIZE]
+    /// Creates an iterator over the rows of the table.
+    fn table_end(&mut self) -> Cursor {
+        let row_num = self.num_rows;
+        Cursor {
+            table: self,
+            row_num,
+            end_of_table: true,
+        }
     }
 }
 
-/// Manages database file pages and an in-memory page cache.
+/// Manages reading and writing pages from the database file.
+/// Implements an in-memory cache to reduce disk I/O.
 struct Pager {
-    file_descriptor: File,
+    file: File,
     file_length: u64,
     pages: [Option<Box<[u8; PAGE_SIZE]>>; TABLE_MAX_PAGES],
 }
@@ -305,40 +338,33 @@ impl Pager {
             .expect("Error while opening pager");
 
         let file_length = file.seek(SeekFrom::End(0))?;
-
-        let pages: [Option<Box<[u8; PAGE_SIZE]>>; TABLE_MAX_PAGES] = std::array::from_fn(|_| None);
+        let pages = std::array::from_fn(|_| None);
 
         Ok(Self {
-            file_descriptor: file,
+            file,
             file_length,
             pages,
         })
     }
 
     /// Retrieves a page from the pager's cache or loads it from the file.
-    pub fn get_page(&mut self, page_num: usize) -> &mut Box<[u8; PAGE_SIZE]> {
-        if page_num >= TABLE_MAX_PAGES {
-            panic!(
-                "Tried to fetch page number out of bounds. {} >= {}",
-                page_num, TABLE_MAX_PAGES
-            )
-        }
+    pub fn get_page(&mut self, page_num: usize) -> &mut [u8; PAGE_SIZE] {
+        assert!(page_num < TABLE_MAX_PAGES, "Page number out of bounds");
 
         if self.pages[page_num].is_none() {
             // Cache miss. Allocate memory and load from file.
             let mut page = Box::new([0u8; PAGE_SIZE]);
+            let num_pages_on_disk = (self.file_length as usize).div_ceil(PAGE_SIZE);
 
-            let num_pages = (self.file_length as usize).div_ceil(PAGE_SIZE);
-
-            if page_num < num_pages {
-                self.file_descriptor
+            if page_num < num_pages_on_disk {
+                self.file
                     .seek(io::SeekFrom::Start((page_num * PAGE_SIZE) as u64))
                     .expect("Unable to set page offset in file.");
 
                 let remaining_bytes = self.file_length as usize - (page_num * PAGE_SIZE);
                 let bytes_to_read = std::cmp::min(remaining_bytes, PAGE_SIZE);
                 if bytes_to_read > 0 {
-                    self.file_descriptor
+                    self.file
                         .read_exact(&mut page[..bytes_to_read])
                         .expect("Unable to read the page from file.");
                 }
@@ -352,30 +378,36 @@ impl Pager {
             .expect("Accessing to not existing page.")
     }
 
-    /// Remove the page from memory.
-    pub fn clear_page(&mut self, page_num: usize) {
-        if self.pages[page_num].is_none() {
-            return;
-        }
-
-        self.pages[page_num] = None
-    }
-
     /// Writes a page to the file.
-    pub fn flush_page(&mut self, page_num: usize, size: usize) {
+    pub fn flush_page(&mut self, page_num: usize, size: usize) -> io::Result<()> {
         if self.pages[page_num].is_none() {
             panic!("Tried to flush a null page: {}", page_num);
         }
 
-        self.file_descriptor
-            .seek(io::SeekFrom::Start((page_num * PAGE_SIZE) as u64))
-            .expect("Error seeking");
-
+        self.file
+            .seek(SeekFrom::Start((page_num * PAGE_SIZE) as u64))?;
         if let Some(page) = self.pages[page_num].as_ref() {
-            self.file_descriptor
-                .write_all(&page[..size])
-                .expect("Error writing");
+            self.file.write_all(&page[..size])?;
         }
+
+        Ok(())
+    }
+
+    /// Flushes all dirty pages to disk before closing.
+    fn flush_all(&mut self, num_rows: usize) -> io::Result<()> {
+        let num_full_pages = num_rows / ROWS_PER_PAGE;
+        for i in 0..num_full_pages {
+            self.flush_page(i, PAGE_SIZE)?;
+        }
+
+        let num_additional_rows = num_rows % ROWS_PER_PAGE;
+        if num_additional_rows > 0 {
+            let last_page_num = num_full_pages;
+            let size_to_flush = num_additional_rows * ROW_SIZE;
+            self.flush_page(last_page_num, size_to_flush)?;
+        }
+
+        self.file.flush()
     }
 }
 
@@ -409,37 +441,31 @@ fn main() {
         print_prompt();
         input_buffer.read_input();
 
+        if input_buffer.buffer.is_empty() {
+            continue;
+        }
+
         let statement = match InputType::parse(&input_buffer.buffer) {
             InputType::Meta(MetaCommands::Exit) => {
-                table.close();
+                table.db_close().expect("Error while closing db");
                 break;
             }
             InputType::Meta(MetaCommands::Unrecognized) => {
                 println!("Unrecognized command: {}.", input_buffer.buffer);
                 continue;
             }
-            InputType::PrepareStatement(PrepareStatement::SyntaxError) => {
-                println!("Syntax error. Could not parse statement.");
-                continue;
-            }
-            InputType::PrepareStatement(PrepareStatement::StringTooLong) => {
-                println!("String is too long.");
-                continue;
-            }
-            InputType::PrepareStatement(PrepareStatement::NegativeID) => {
-                println!("ID must be positive.");
-                continue;
-            }
-            InputType::PrepareStatement(PrepareStatement::Unrecognized) => {
-                println!("Unrecognized keyword at start of {}.", input_buffer.buffer);
-                continue;
-            }
-            InputType::PrepareStatement(PrepareStatement::Success(st)) => st,
+            InputType::Statement(statement) => match statement {
+                Ok(statement) => statement,
+                Err(err) => {
+                    println!("{}", err);
+                    continue;
+                }
+            },
         };
 
         match statement.execute(&mut table) {
-            ExecuteResult::Success => println!("Executed."),
-            ExecuteResult::TableFull => println!("Error: Table full."),
+            Ok(_) => println!("Executed."),
+            Err(err) => println!("{}", err),
         }
     }
 }
@@ -447,7 +473,7 @@ fn main() {
 /// A top-level enum to determine if the input is a meta-command or a SQL statement.
 enum InputType {
     Meta(MetaCommands),
-    PrepareStatement(PrepareStatement),
+    Statement(Result<Statement, PrepareError>),
 }
 
 impl InputType {
@@ -456,7 +482,7 @@ impl InputType {
         if let Some(meta) = MetaCommands::parse(input) {
             InputType::Meta(meta)
         } else {
-            InputType::PrepareStatement(PrepareStatement::parse(input))
+            InputType::Statement(Statement::prepare(input))
         }
     }
 }
